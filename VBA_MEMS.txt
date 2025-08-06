@@ -1,0 +1,808 @@
+Sub ImporterEtGrapherTestCSV()
+    Dim cheminFichier As Variant
+    Dim wsData As Worksheet, wsGraph As Worksheet, wsSynthese As Worksheet
+    Dim tbl As ListObject
+    Dim dict As Object
+    Dim i As Long, lastRow As Long
+    Dim testID As String, cle As Variant
+    Dim plage As Range
+    Dim ch As ChartObject
+    Dim posTop As Double, posLeft As Double
+    Dim tempWB As Workbook
+    Dim graphiquesParLigne As Integer
+    
+    ' Configuration des graphiques
+    graphiquesParLigne = 2 ' Nombre de graphiques par ligne
+    
+    ' Désactiver les alertes et l'actualisation écran
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    ' 1. Sélection fichier CSV
+    cheminFichier = Application.GetOpenFilename("Fichiers CSV (*.csv), *.csv", , "Sélectionner un fichier de test CSV")
+    If cheminFichier = False Then
+        Application.ScreenUpdating = True
+        Exit Sub
+    End If
+
+    ' 2. Préparation feuille de données
+    On Error Resume Next
+    Set wsData = ThisWorkbook.Sheets("Donnees")
+    On Error GoTo 0
+    
+    If wsData Is Nothing Then
+        Set wsData = ThisWorkbook.Sheets.Add
+        wsData.Name = "Donnees"
+    Else
+        wsData.Cells.Clear
+        ' Supprimer les tableaux existants
+        Dim j As Integer
+        For j = wsData.ListObjects.Count To 1 Step -1
+            wsData.ListObjects(j).Delete
+        Next j
+    End If
+
+    ' 3. Importer le CSV et renommer les colonnes
+    Set tempWB = Workbooks.Open(cheminFichier, Format:=6, Delimiter:=",")
+    tempWB.Sheets(1).UsedRange.Copy wsData.Range("A1")
+    tempWB.Close False
+    
+    ' Renommer les en-têtes pour plus de clarté
+    wsData.Cells(1, 4).Value = "I_act"  ' au lieu de I_mA
+    wsData.Cells(1, 5).Value = "V_act"  ' au lieu de V_A2_mV
+    wsData.Cells(1, 6).Value = "P_act"  ' au lieu de P_mW
+    wsData.Cells(1, 7).Value = "V_differentiel_pont"  ' au lieu de V_diff_mV
+    wsData.Cells(1, 8).Value = "R_contact"  ' au lieu de R_ohms
+
+    ' 4. Réorganiser les colonnes en insérant R_heater à la colonne F
+    ' D'abord insérer une colonne à la position F
+    wsData.Columns("F:F").Insert Shift:=xlToRight
+    
+    ' Maintenant les colonnes sont :
+    ' A=TestID, B=DAC, C=Time_ms, D=I_act, E=V_act, F=NOUVELLE, G=P_act, H=V_differentiel_pont, I=R_contact
+    
+    ' Ajouter l'en-tête R_heater à la nouvelle colonne F
+    wsData.Cells(1, 6).Value = "R_heater"
+    With wsData.Range("F1")
+        .Interior.Color = RGB(255, 200, 100)
+        .Font.Bold = True
+        .Font.Color = RGB(0, 0, 0)
+    End With
+
+    ' 5. Vérifier les données importées
+    lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
+    If lastRow < 2 Then
+        MsgBox "Aucune donnée trouvée dans le fichier CSV.", vbCritical
+        GoTo Cleanup
+    End If
+    
+    ' Vérifier qu'il y a maintenant 9 colonnes (8 originales + 1 insérée)
+    If wsData.Cells(1, 9).Value = "" Then
+        MsgBox "Problème avec la structure des colonnes.", vbCritical
+        GoTo Cleanup
+    End If
+
+    ' 6. Calculer R_heater = V_act / I_act pour chaque ligne
+    For i = 2 To lastRow
+        Dim vValue As Variant, iValue As Variant
+        vValue = wsData.Cells(i, 5).Value ' V_act (colonne E)
+        iValue = wsData.Cells(i, 4).Value ' I_act (colonne D)
+        
+        If IsNumeric(iValue) And IsNumeric(vValue) Then
+            If CDbl(iValue) <> 0 Then
+                wsData.Cells(i, 6).Value = CDbl(vValue) / CDbl(iValue) ' R_heater = V/I en ohms (colonne F)
+            Else
+                wsData.Cells(i, 6).Value = ""
+            End If
+        Else
+            wsData.Cells(i, 6).Value = ""
+        End If
+    Next i
+
+    ' 7. Créer tableau structuré avec la nouvelle colonne
+    Set tbl = wsData.ListObjects.Add(xlSrcRange, wsData.Range("A1").CurrentRegion, , xlYes)
+    tbl.Name = "DonneesTest"
+    
+    ' 8. Récupérer tous les TestID uniques et les trier
+    Set dict = CreateObject("Scripting.Dictionary")
+    For i = 2 To lastRow
+        testID = CStr(wsData.Cells(i, 1).Value) ' TestID en colonne A
+        If testID <> "" And Not dict.exists(testID) Then
+            dict.Add testID, 1
+        End If
+    Next i
+    
+    If dict.Count = 0 Then
+        MsgBox "Aucun TestID trouvé dans les données.", vbCritical
+        GoTo Cleanup
+    End If
+
+    ' Trier les TestID (conversion en array pour tri)
+    Dim testIDs() As String
+    Dim k As Long
+    ReDim testIDs(dict.Count - 1)
+    k = 0
+    For Each cle In dict.Keys
+        testIDs(k) = CStr(cle)
+        k = k + 1
+    Next cle
+    
+    ' Tri simple des TestID
+    Call TrierTableau(testIDs)
+
+    ' 9. Préparation feuille des graphiques individuels
+    On Error Resume Next
+    Set wsGraph = ThisWorkbook.Sheets("Graphiques_TestID")
+    If Not wsGraph Is Nothing Then wsGraph.Delete
+    On Error GoTo 0
+    
+    Set wsGraph = ThisWorkbook.Sheets.Add
+    wsGraph.Name = "Graphiques_TestID"
+    wsGraph.Tab.Color = RGB(70, 130, 180)
+    
+    ' En-tête principal pour graphiques individuels
+    With wsGraph.Range("A1:P3")
+        .Merge
+        .Value = " GRAPHIQUES PAR TEST ID - " & Format(Now, "dd/mm/yyyy à hh:mm")
+        .Font.Size = 18
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(70, 130, 180)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+    
+    ' Informations sur le fichier
+    wsGraph.Range("A5").Value = "Fichier: " & Right(cheminFichier, Len(cheminFichier) - InStrRev(cheminFichier, "\"))
+    wsGraph.Range("A6").Value = "TestID analysés: " & dict.Count & " | Mesures totales: " & (lastRow - 1)
+    wsGraph.Range("A7").Value = " Axe gauche: I_act/P_act | Axe droite: V_act/R_heater"
+    
+    With wsGraph.Range("A5:A7")
+        .Font.Size = 11
+        .Font.Bold = True
+    End With
+
+    ' 10. Créer les graphiques pour chaque TestID - AVEC NOUVELLES COULEURS
+    posTop = 150
+    posLeft = 30
+    Dim compteurGraphiques As Long, graphiqueSurLigne As Long
+    compteurGraphiques = 0
+    graphiqueSurLigne = 0
+    
+    For k = 0 To UBound(testIDs)
+        cle = testIDs(k)
+        
+        ' Effacer les filtres existants d'abord
+        On Error Resume Next
+        tbl.AutoFilter.ShowAllData
+        On Error GoTo 0
+        
+        ' Filtrer par TestID
+        tbl.Range.AutoFilter Field:=1, Criteria1:=cle
+        
+        ' Vérifier qu'il y a des données visibles après filtrage
+        Dim visibleRows As Long
+        visibleRows = 0
+        
+        ' Compter les lignes visibles pour ce TestID
+        For i = 2 To lastRow
+            If Not wsData.Rows(i).Hidden And CStr(wsData.Cells(i, 1).Value) = cle Then
+                visibleRows = visibleRows + 1
+            End If
+        Next i
+        
+        Debug.Print "TestID: " & cle & " - Lignes visibles: " & visibleRows
+        
+        If visibleRows > 0 Then
+            ' Calculer la position du graphique
+            If graphiqueSurLigne >= graphiquesParLigne Then
+                posTop = posTop + 380
+                posLeft = 30
+                graphiqueSurLigne = 0
+            End If
+            
+            ' GRAPHIQUE 1: I_act/P_act + V_act/R_heater vs Temps avec DOUBLE AXE
+            Set ch = wsGraph.ChartObjects.Add(Left:=posLeft, Width:=550, Top:=posTop, Height:=350)
+            
+            With ch.Chart
+                .ChartType = xlXYScatterLines
+                .HasTitle = True
+                .ChartTitle.Text = "Test ID " & cle & " - Électrique (" & visibleRows & " pts)"
+                
+                ' Supprimer toutes les séries existantes
+                Do While .SeriesCollection.Count > 0
+                    .SeriesCollection(1).Delete
+                Loop
+                
+                ' Créer les plages de données manuellement pour les données filtrées
+                Dim xData() As Variant, yData1() As Variant, yData2() As Variant, yData3() As Variant, yData4() As Variant
+                Dim yData5() As Variant, yData6() As Variant
+                ReDim xData(1 To visibleRows)
+                ReDim yData1(1 To visibleRows)
+                ReDim yData2(1 To visibleRows)
+                ReDim yData3(1 To visibleRows)
+                ReDim yData4(1 To visibleRows)
+                ReDim yData5(1 To visibleRows)
+                ReDim yData6(1 To visibleRows)
+                
+                Dim dataIndex As Long
+                dataIndex = 1
+                
+                For i = 2 To lastRow
+                    If Not wsData.Rows(i).Hidden And CStr(wsData.Cells(i, 1).Value) = cle Then
+                        ' Conversion sécurisée avec vérification
+                        If IsNumeric(wsData.Cells(i, 3).Value) Then
+                            xData(dataIndex) = CDbl(wsData.Cells(i, 3).Value)   ' Time_ms
+                        Else
+                            xData(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 4).Value) Then
+                            yData1(dataIndex) = CDbl(wsData.Cells(i, 4).Value)  ' I_act
+                        Else
+                            yData1(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 5).Value) Then
+                            yData2(dataIndex) = CDbl(wsData.Cells(i, 5).Value)  ' V_act
+                        Else
+                            yData2(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 7).Value) Then
+                            yData3(dataIndex) = CDbl(wsData.Cells(i, 7).Value)  ' P_act (colonne G)
+                        Else
+                            yData3(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 6).Value) Then
+                            yData4(dataIndex) = CDbl(wsData.Cells(i, 6).Value)  ' R_heater
+                        Else
+                            yData4(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 8).Value) Then
+                            yData5(dataIndex) = CDbl(wsData.Cells(i, 8).Value)  ' V_differentiel_pont (colonne H)
+                        Else
+                            yData5(dataIndex) = 0
+                        End If
+                        
+                        If IsNumeric(wsData.Cells(i, 9).Value) Then
+                            yData6(dataIndex) = CDbl(wsData.Cells(i, 9).Value)  ' R_contact (colonne I)
+                        Else
+                            yData6(dataIndex) = 0
+                        End If
+                        
+                        dataIndex = dataIndex + 1
+                    End If
+                Next i
+                
+                ' Série 1: Courant (I_act) - Axe principal
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(1)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData1  ' I_act sur l'axe Y
+                    .Name = "Courant I_act (mA)"
+                    .Format.Line.ForeColor.RGB = RGB(255, 0, 0)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleCircle
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(255, 0, 0)
+                    .MarkerBackgroundColor = RGB(255, 200, 200)
+                    .AxisGroup = xlPrimary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                ' Série 2: Puissance (P_act) - Axe principal
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(2)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData3  ' P_act sur l'axe Y
+                    .Name = "Puissance P_act (mW)"
+                    .Format.Line.ForeColor.RGB = RGB(0, 180, 0)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleDiamond
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(0, 180, 0)
+                    .MarkerBackgroundColor = RGB(200, 255, 200)
+                    .AxisGroup = xlPrimary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                ' Série 3: Tension (V_act) - Axe secondaire
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(3)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData2  ' V_act sur l'axe Y
+                    .Name = "Tension V_act (mV)"
+                    .Format.Line.ForeColor.RGB = RGB(0, 128, 255)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleSquare
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(0, 128, 255)
+                    .MarkerBackgroundColor = RGB(200, 220, 255)
+                    .AxisGroup = xlSecondary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                ' Série 4: R_heater - Axe secondaire
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(4)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData4  ' R_heater sur l'axe Y
+                    .Name = "Résistance R_heater (O)"
+                    .Format.Line.ForeColor.RGB = RGB(128, 0, 128)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleTriangle
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(128, 0, 128)
+                    .MarkerBackgroundColor = RGB(220, 200, 220)
+                    .AxisGroup = xlSecondary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                Call ConfigurerGraphique(ch.Chart, "I_act (mA) / P_act (mW)", "V_act (mV) / R_heater (O)")
+            End With
+            
+            ' GRAPHIQUE 2: V_differentiel_pont et R_contact vs Temps - NOUVELLES COULEURS
+            ' Repositionner pour le deuxième graphique du même TestID
+            graphiqueSurLigne = graphiqueSurLigne + 1
+            If graphiqueSurLigne >= graphiquesParLigne Then
+                posTop = posTop + 380
+                posLeft = 30
+                graphiqueSurLigne = 0
+            Else
+                posLeft = posLeft + 580
+            End If
+            
+            Set ch = wsGraph.ChartObjects.Add(Left:=posLeft, Width:=550, Top:=posTop, Height:=350)
+            
+            With ch.Chart
+                .ChartType = xlXYScatterLines
+                .HasTitle = True
+                .ChartTitle.Text = "Test ID " & cle & " - Pont Wheatstone (" & visibleRows & " pts)"
+                
+                ' Supprimer toutes les séries existantes
+                Do While .SeriesCollection.Count > 0
+                    .SeriesCollection(1).Delete
+                Loop
+                
+                ' Série 1: V_differentiel_pont - Axe principal - COULEUR BLEUE
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(1)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData5  ' V_differentiel_pont sur l'axe Y
+                    .Name = "V différentiel pont (mV)"
+                    .Format.Line.ForeColor.RGB = RGB(0, 128, 255)  ' BLEU (comme axe)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleDiamond
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(0, 128, 255)
+                    .MarkerBackgroundColor = RGB(200, 220, 255)
+                    .AxisGroup = xlPrimary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                ' Série 2: R_contact - Axe secondaire - COULEUR ROUGE
+                .SeriesCollection.NewSeries
+                With .SeriesCollection(2)
+                    .xValues = xData  ' Temps sur l'axe X
+                    .Values = yData6  ' R_contact sur l'axe Y
+                    .Name = "R_contact (O)"
+                    .Format.Line.ForeColor.RGB = RGB(255, 0, 0)  ' ROUGE (comme axe)
+                    .Format.Line.Weight = 1.5
+                    .MarkerStyle = xlMarkerStyleSquare
+                    .MarkerSize = IIf(visibleRows = 1, 6, 3)
+                    .MarkerForegroundColor = RGB(255, 0, 0)
+                    .MarkerBackgroundColor = RGB(255, 200, 200)
+                    .AxisGroup = xlSecondary
+                    If visibleRows = 1 Then .Format.Line.Visible = False
+                End With
+                
+                Call ConfigurerGraphiquePont(ch.Chart, "V différentiel pont (mV)", "R_contact (O)")
+            End With
+            
+            compteurGraphiques = compteurGraphiques + 2  ' On a ajouté 2 graphiques
+            graphiqueSurLigne = graphiqueSurLigne + 1
+            posLeft = posLeft + 580
+            
+        Else
+            Debug.Print "Aucune donnée trouvée pour TestID: " & cle
+        End If
+    Next k
+    
+    ' Nettoyer les filtres à la fin
+    On Error Resume Next
+    tbl.AutoFilter.ShowAllData
+    On Error GoTo 0
+    
+    ' 11. Créer la feuille de synthèse avec graphiques de corrélation
+    Call CreerGraphiquesSynthese(wsData, testIDs, CStr(cheminFichier))
+    
+    ' Supprimer tous les filtres
+    On Error Resume Next
+    wsData.ShowAllData
+    On Error GoTo 0
+    
+    ' Mise en forme de la feuille de données
+    wsData.Columns.AutoFit
+    With wsData.Range("A1").CurrentRegion
+        .Borders.LineStyle = xlContinuous
+        .Borders.Weight = xlThin
+        .Borders.ColorIndex = xlAutomatic
+    End With
+    
+    ' En-tête de la feuille de données
+    With wsData.Range("A1:I1")
+        .Interior.Color = RGB(70, 130, 180)
+        .Font.Color = RGB(255, 255, 255)
+        .Font.Bold = True
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+    
+    ' Activer la feuille des graphiques
+    wsGraph.Activate
+    wsGraph.Range("A1").Select
+    
+Cleanup:
+    ' Réactiver les alertes et l'actualisation écran
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+    
+    ' Message final détaillé
+    If compteurGraphiques > 0 Then
+        Dim message As String
+        message = " ANALYSE COMPLÈTE TERMINÉE !" & vbCrLf & vbCrLf
+        message = message & " Résultats créés :" & vbCrLf
+        message = message & "   • " & compteurGraphiques & " graphiques (2 par TestID)" & vbCrLf
+        message = message & "   • 1 graphique de synthèse (R_contact vs V_act)" & vbCrLf
+        message = message & "   • Colonne R_heater calculée (V_act/I_act)" & vbCrLf & vbCrLf
+        message = message & "Consultez les onglets :" & vbCrLf
+        message = message & "   • 'Donnees'  Tableau avec R_heater" & vbCrLf
+        message = message & "   • 'Graphiques_TestID'  2 graphiques par test" & vbCrLf
+        message = message & "   • 'Synthese'  Analyse R_contact vs V_act" & vbCrLf & vbCrLf
+        message = message & " " & dict.Count & " TestID analysés"
+        
+        MsgBox message, vbInformation, "Analyse terminée"
+    Else
+        MsgBox " Aucun graphique n'a pu être créé." & vbCrLf & "Vérifiez le format de vos données.", vbExclamation
+    End If
+End Sub
+
+' NOUVELLE FONCTION pour configurer le graphique Pont avec les bonnes couleurs d'axes
+Sub ConfigurerGraphiquePont(ByRef monGraphique As Chart, axePrincipal As String, axeSecondaire As String)
+    With monGraphique
+        ' Configuration de l'axe X
+        With .Axes(xlCategory, xlPrimary)
+            .HasTitle = True
+            .AxisTitle.Text = "Temps (ms)"
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .TickLabels.Font.Size = 9
+            .MajorGridlines.Format.Line.ForeColor.RGB = RGB(240, 240, 240)
+            .HasMajorGridlines = True
+        End With
+        
+        ' Configuration de l'axe Y principal (gauche) - V_differentiel_pont - BLEU
+        With .Axes(xlValue, xlPrimary)
+            .HasTitle = True
+            .AxisTitle.Text = axePrincipal
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .AxisTitle.Font.Color = RGB(0, 128, 255) ' BLEU
+            .TickLabels.Font.Size = 9
+            .TickLabels.Font.Color = RGB(0, 100, 200) ' BLEU foncé
+            .MajorGridlines.Format.Line.ForeColor.RGB = RGB(240, 240, 240)
+            .HasMajorGridlines = True
+        End With
+        
+        ' Configuration de l'axe Y secondaire (droite) - R_contact - ROUGE
+        With .Axes(xlValue, xlSecondary)
+            .HasTitle = True
+            .AxisTitle.Text = axeSecondaire
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .AxisTitle.Font.Color = RGB(255, 0, 0) ' ROUGE
+            .TickLabels.Font.Size = 9
+            .TickLabels.Font.Color = RGB(180, 0, 0) ' ROUGE foncé
+            .HasMajorGridlines = False ' Éviter la confusion avec les grilles principales
+        End With
+        
+        ' Configuration de la légende
+        .HasLegend = True
+        With .Legend
+            .Position = xlLegendPositionBottom
+            .Font.Size = 9
+            .Font.Bold = False
+        End With
+        
+        ' Style général du graphique
+        .PlotArea.Format.Fill.Visible = msoFalse
+        .ChartArea.Format.Line.ForeColor.RGB = RGB(180, 180, 180)
+        .ChartArea.Format.Line.Weight = 1
+        .PlotArea.Format.Line.ForeColor.RGB = RGB(200, 200, 200)
+        .PlotArea.Format.Line.Weight = 0.75
+        
+        ' Couleur de fond du graphique
+        .ChartArea.Format.Fill.Visible = msoTrue
+        .ChartArea.Format.Fill.ForeColor.RGB = RGB(250, 250, 250)
+    End With
+End Sub
+
+Sub CreerGraphiquesSynthese(wsData As Worksheet, testIDs() As String, cheminFichier As String)
+    Dim wsSynthese As Worksheet
+    Dim ch As ChartObject
+    Dim i As Long, lastRow As Long
+    Dim testID As String
+    Dim j As Long
+    Dim idx As Long
+    
+    ' Créer la feuille de synthèse
+    On Error Resume Next
+    Set wsSynthese = ThisWorkbook.Sheets("Synthese")
+    If Not wsSynthese Is Nothing Then wsSynthese.Delete
+    On Error GoTo 0
+    
+    Set wsSynthese = ThisWorkbook.Sheets.Add
+    wsSynthese.Name = "Synthese"
+    wsSynthese.Tab.Color = RGB(200, 100, 0)
+    
+    ' En-tête
+    With wsSynthese.Range("A1:L3")
+        .Merge
+        .Value = " ANALYSE DE SYNTHÈSE - " & Format(Now, "dd/mm/yyyy à hh:mm")
+        .Font.Size = 18
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(200, 100, 0)
+        .HorizontalAlignment = xlHAlignCenter
+        .VerticalAlignment = xlVAlignCenter
+    End With
+    
+    ' Informations
+    wsSynthese.Range("A5").Value = "Fichier: " & Right(cheminFichier, Len(cheminFichier) - InStrRev(cheminFichier, "\"))
+    wsSynthese.Range("A6").Value = "Analyse: Corrélation R_contact vs V_act"
+    With wsSynthese.Range("A5:A6")
+        .Font.Size = 11
+        .Font.Bold = True
+    End With
+    
+    lastRow = wsData.Cells(wsData.Rows.Count, "A").End(xlUp).Row
+    
+    ' Calculer et afficher les statistiques d'abord - AVANT les graphiques
+    Dim minRContact As Double, maxRContact As Double, avgRContact As Double
+    Dim minRHeater As Double, maxRHeater As Double, avgRHeater As Double
+    minRContact = 999999: maxRContact = -999999: avgRContact = 0
+    minRHeater = 999999: maxRHeater = -999999: avgRHeater = 0
+    
+    Dim countRContact As Long, countRHeater As Long
+    countRContact = 0: countRHeater = 0
+    
+    For i = 2 To lastRow
+        If IsNumeric(wsData.Cells(i, 9).Value) Then
+            Dim valContact As Double
+            valContact = wsData.Cells(i, 9).Value
+            If valContact < minRContact Then minRContact = valContact
+            If valContact > maxRContact Then maxRContact = valContact
+            avgRContact = avgRContact + valContact
+            countRContact = countRContact + 1
+        End If
+        
+        If IsNumeric(wsData.Cells(i, 6).Value) Then
+            Dim valHeater As Double
+            valHeater = wsData.Cells(i, 6).Value
+            If valHeater < minRHeater Then minRHeater = valHeater
+            If valHeater > maxRHeater Then maxRHeater = valHeater
+            avgRHeater = avgRHeater + valHeater
+            countRHeater = countRHeater + 1
+        End If
+    Next i
+    
+    If countRContact > 0 Then avgRContact = avgRContact / countRContact
+    If countRHeater > 0 Then avgRHeater = avgRHeater / countRHeater
+    
+    ' Ajout d'un résumé statistique - POSITIONNÉ EN HAUT
+    With wsSynthese.Range("A9:L11")
+        .Merge
+        .Value = " RÉSUMÉ STATISTIQUE"
+        .Font.Size = 14
+        .Font.Bold = True
+        .Interior.Color = RGB(240, 240, 240)
+        .HorizontalAlignment = xlHAlignCenter
+    End With
+    
+    ' Afficher les statistiques
+    wsSynthese.Range("A13").Value = "R_contact:"
+    wsSynthese.Range("B13").Value = "Min = " & Format(minRContact, "0.00") & " O"
+    wsSynthese.Range("D13").Value = "Max = " & Format(maxRContact, "0.00") & " O"
+    wsSynthese.Range("F13").Value = "Moy = " & Format(avgRContact, "0.00") & " O"
+    
+    wsSynthese.Range("A14").Value = "R_heater:"
+    wsSynthese.Range("B14").Value = "Min = " & Format(minRHeater, "0.00") & " O"
+    wsSynthese.Range("D14").Value = "Max = " & Format(maxRHeater, "0.00") & " O"
+    wsSynthese.Range("F14").Value = "Moy = " & Format(avgRHeater, "0.00") & " O"
+    
+    With wsSynthese.Range("A13:F14")
+        .Font.Size = 11
+        .Font.Bold = True
+    End With
+    
+    ' GRAPHIQUE UNIQUE: R_contact vs V_act - DÉCALÉ VERS LE BAS
+    Set ch = wsSynthese.ChartObjects.Add(Left:=30, Width:=800, Top:=200, Height:=500)
+    With ch.Chart
+        .ChartType = xlXYScatter
+        .HasTitle = True
+        .ChartTitle.Text = "Corrélation R_contact vs V_act"
+        
+        ' Collecter les données valides
+        Dim rContactValues() As Variant, vActValues() As Variant
+        Dim validCount As Long
+        validCount = 0
+        
+        ' Compter d'abord les valeurs valides
+        For i = 2 To lastRow
+            If IsNumeric(wsData.Cells(i, 9).Value) And IsNumeric(wsData.Cells(i, 5).Value) Then
+                validCount = validCount + 1
+            End If
+        Next i
+        
+        If validCount > 0 Then
+            ReDim rContactValues(1 To validCount)
+            ReDim vActValues(1 To validCount)
+            
+            idx = 1
+            
+            For i = 2 To lastRow
+                If IsNumeric(wsData.Cells(i, 9).Value) And IsNumeric(wsData.Cells(i, 5).Value) Then
+                    vActValues(idx) = CDbl(wsData.Cells(i, 5).Value)  ' V_act (axe X)
+                    rContactValues(idx) = CDbl(wsData.Cells(i, 9).Value)  ' R_contact (axe Y)
+                    idx = idx + 1
+                End If
+            Next i
+            
+            ' Ajouter la série avec couleurs personnalisées par TestID
+            .SeriesCollection.NewSeries
+            With .SeriesCollection(1)
+                .xValues = vActValues
+                .Values = rContactValues
+                .Name = "R_contact"
+                .MarkerStyle = xlMarkerStyleCircle
+                .MarkerSize = 4
+                .MarkerForegroundColor = RGB(255, 100, 0)  ' Orange
+                .MarkerBackgroundColor = RGB(255, 100, 0)
+                .Format.Line.Visible = False
+            End With
+            
+            ' Ajouter une ligne de tendance
+            .SeriesCollection(1).Trendlines.Add
+            With .SeriesCollection(1).Trendlines(1)
+                .Type = xlLinear
+                .Format.Line.ForeColor.RGB = RGB(100, 100, 100)
+                .Format.Line.Weight = 2
+                .DisplayEquation = True
+                .DisplayRSquared = True
+            End With
+            
+            ' Configuration des axes
+            With .Axes(xlCategory)
+                .HasTitle = True
+                .AxisTitle.Text = "V_act (mV)"
+                .AxisTitle.Font.Size = 12
+                .AxisTitle.Font.Bold = True
+                .TickLabels.Font.Size = 10
+                .MajorGridlines.Format.Line.ForeColor.RGB = RGB(220, 220, 220)
+                .HasMajorGridlines = True
+            End With
+            
+            With .Axes(xlValue)
+                .HasTitle = True
+                .AxisTitle.Text = "R_contact (O)"
+                .AxisTitle.Font.Size = 12
+                .AxisTitle.Font.Bold = True
+                .TickLabels.Font.Size = 10
+                .MajorGridlines.Format.Line.ForeColor.RGB = RGB(220, 220, 220)
+                .HasMajorGridlines = True
+            End With
+            
+            ' Configuration du titre
+            With .ChartTitle
+                .Font.Size = 14
+                .Font.Bold = True
+                .Font.Color = RGB(70, 130, 180)
+            End With
+            
+            ' Configuration de la légende
+            .HasLegend = True
+            With .Legend
+                .Position = xlLegendPositionBottom
+                .Font.Size = 10
+            End With
+            
+            ' Style général du graphique
+            .PlotArea.Format.Fill.Visible = msoFalse
+            .ChartArea.Format.Line.ForeColor.RGB = RGB(180, 180, 180)
+            .ChartArea.Format.Line.Weight = 1
+            .PlotArea.Format.Line.ForeColor.RGB = RGB(200, 200, 200)
+            .PlotArea.Format.Line.Weight = 0.75
+            
+            ' Couleur de fond du graphique
+            .ChartArea.Format.Fill.Visible = msoTrue
+            .ChartArea.Format.Fill.ForeColor.RGB = RGB(250, 250, 250)
+        End If
+    End With
+    
+    ' Message dans la console
+    Debug.Print "Feuille de synthèse créée avec 1 graphique de corrélation"
+End Sub
+
+Sub TrierTableau(arr() As String)
+    Dim i As Long, j As Long, temp As String
+    For i = LBound(arr) To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If Val(arr(i)) > Val(arr(j)) Then
+                temp = arr(i)
+                arr(i) = arr(j)
+                arr(j) = temp
+            End If
+        Next j
+    Next i
+End Sub
+
+Sub ConfigurerGraphique(ByRef monGraphique As Chart, axePrincipal As String, axeSecondaire As String)
+    With monGraphique
+        ' Configuration de l'axe X
+        With .Axes(xlCategory, xlPrimary)
+            .HasTitle = True
+            .AxisTitle.Text = "Temps (ms)"
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .TickLabels.Font.Size = 9
+            .MajorGridlines.Format.Line.ForeColor.RGB = RGB(240, 240, 240)
+            .HasMajorGridlines = True
+        End With
+        
+        ' Configuration de l'axe Y principal (gauche) - Courant et Puissance
+        With .Axes(xlValue, xlPrimary)
+            .HasTitle = True
+            .AxisTitle.Text = axePrincipal
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .AxisTitle.Font.Color = RGB(255, 0, 0) ' Rouge comme le courant
+            .TickLabels.Font.Size = 9
+            .TickLabels.Font.Color = RGB(180, 0, 0)
+            .MajorGridlines.Format.Line.ForeColor.RGB = RGB(240, 240, 240)
+            .HasMajorGridlines = True
+        End With
+        
+        ' Configuration de l'axe Y secondaire (droite) - Tension et R_heater
+        With .Axes(xlValue, xlSecondary)
+            .HasTitle = True
+            .AxisTitle.Text = axeSecondaire
+            .AxisTitle.Font.Size = 10
+            .AxisTitle.Font.Bold = True
+            .AxisTitle.Font.Color = RGB(0, 128, 255) ' Bleu comme la tension
+            .TickLabels.Font.Size = 9
+            .TickLabels.Font.Color = RGB(0, 100, 200)
+            .HasMajorGridlines = False ' Éviter la confusion avec les grilles principales
+        End With
+        
+        ' Configuration de la légende
+        .HasLegend = True
+        With .Legend
+            .Position = xlLegendPositionBottom
+            .Font.Size = 9
+            .Font.Bold = False
+        End With
+        
+        ' Style général du graphique
+        .PlotArea.Format.Fill.Visible = msoFalse
+        .ChartArea.Format.Line.ForeColor.RGB = RGB(180, 180, 180)
+        .ChartArea.Format.Line.Weight = 1
+        .PlotArea.Format.Line.ForeColor.RGB = RGB(200, 200, 200)
+        .PlotArea.Format.Line.Weight = 0.75
+        
+        ' Couleur de fond du graphique
+        .ChartArea.Format.Fill.Visible = msoTrue
+        .ChartArea.Format.Fill.ForeColor.RGB = RGB(250, 250, 250)
+    End With
+End Sub
