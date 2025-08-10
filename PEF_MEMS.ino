@@ -65,10 +65,10 @@ const float SEUIL_COURANT_MAX_mA = 70.0;          ///< Courant maximum autorisé
 
 /** @defgroup BRIDGE Configuration du pont de mesure (Optimisable par mesure préalable) */
 /**@{*/
-const float R1 = 10000000.0;                      ///< Résistance R1 du pont
-const float R2 = 10000000.0;                      ///< Résistance R2 du pont
-const float R3 = 10000000.0;                      ///< Résistance R3 du pont
-const float Vexc = 3.313;                         ///< Tension d'excitation du pont(V)
+const float R1 = 9959200.0;                      ///< Résistance R1 du pont
+const float R2 = 9968400.0;                      ///< Résistance R2 du pont
+const float R3 = 9967600.0;                      ///< Résistance R3 du pont
+const float Vexc = 3.2920;                         ///< Tension d'excitation du pont(V)
 /**@}*/
 
 // =============================================================================
@@ -85,7 +85,7 @@ const int NB_TESTS_TOTAL = 10;                    ///< Nombre de tests par cycle
 
 /** @defgroup DETECTION Paramètres de détection */
 /**@{*/
-const float SEUIL_RCONTACT_MIN = 100.0;          ///< Résistance minimum pour détection
+const float SEUIL_RCONTACT_MIN = 0.0;          ///< Résistance minimum pour détection
 const float SEUIL_RESISTANCE_MAX = 500000000.0;   ///< Résistance maximum mesurable
 const uint32_t DUREE_MAX_TEST_MS = 300000;        ///< Timeout test (5 minutes)
 /**@}*/
@@ -148,8 +148,7 @@ struct EtatAffichage {
  * @return true si la résistance est valide
  */
 inline bool resistanceValide(float r) {
-  return (isfinite(r) && !isnan(r) && !isinf(r) && 
-          r > 0 && r < SEUIL_RESISTANCE_MAX && r != -999999.0f);
+  return (r > 0 && r < SEUIL_RESISTANCE_MAX && r != -999999.0f);
 }
 
 /**
@@ -159,21 +158,36 @@ inline bool resistanceValide(float r) {
  */
 inline float calculerResistance(int16_t rawDiff) {
   float Vd = rawDiff * 0.000125f;  // Conversion ADC vers volts
-  float denom = Vexc - 2.0f * Vd;
   
+  // Équation du pont de Wheatstone: Rx = (-(R1*(Vd-Vexc) + R2*Vd)*R3) / (R1*Vd + R2*(Vd+Vexc))
+  float numerateur = -(R1 * (Vd - Vexc) + R2 * Vd) * R3;
+  float denominateur = R1 * Vd + R2 * (Vd + Vexc);
+ 
   // Protection division par zéro
-  if (fabsf(denom) < 1e-6f) return -999999.0f;
-  
-  float resistance = R1 * (Vexc + 2.0f * Vd) / denom;
-  
+  if (fabsf(denominateur) < 1e-6f) return -999999.0f;
+  float resistance = numerateur / denominateur;
   // Validation de la mesure
   if (!resistanceValide(resistance)) {
     return -999999.0f;
   }
-  
   return resistance;
 }
-
+ /*
+  float resistance = numerateur / denominateur;
+ 
+  // Application de la correction cubique pour obtenir la résistance réelle
+  // R_veritable = 16847.53 + 1.0006855380*R_mesure - 3.5793060794e-10*R_mesure² + 7.5312039673e-20*R_mesure³
+  float r2 = resistance * resistance;  // R_mesure²
+  float r3 = r2 * resistance;          // R_mesure³
+  
+  float resistance_corrigee = 16847.53f 
+                             + 1.0006855380f * resistance 
+                             - 3.5793060794e-10f * r2 
+                             + 7.5312039673e-20f * r3;
+ 
+  return resistance_corrigee;
+  /*
+}
 /**
  * @brief  Formate une valeur pour export CSV
  * @param  valeur Valeur à formater
@@ -440,6 +454,63 @@ void tacheMesureUltraRapide(void *param) {
   vTaskDelete(NULL);
 }
 
+/**
+ * @brief  Fonction simple de mesure front montant
+ * @param  dac_activation Valeur DAC de contact détecté
+ */
+ /*
+void mesureFrontMontant(uint8_t dac_activation) {
+  Serial.println(">>> Debut mesure front montant");
+  
+  // Retour DAC à zéro
+  dacWrite(DAC_RELAIS, 0);
+  delay(1000);  // Stabilisation 1 seconde
+  
+  // Ouverture fichier front montant
+  String fichierFront = nomFichier;
+  fichierFront.replace(".csv", "_FRONT.csv");
+  File frontFile = SD.open(fichierFront, FILE_WRITE);
+  
+  if (frontFile) {
+    frontFile.println("Time_ms,R_ohms,I_mA,V_mV");
+  }
+  
+  //Application tension et acquisition
+  uint32_t tempsDebut = millis();
+  dacWrite(DAC_RELAIS, dac_activation);  // Application immédiate de la tension
+  
+  // Acquisition pendant 5 secondes
+  while (millis() - tempsDebut < 5000) {
+    uint32_t temps = millis() - tempsDebut;
+    
+    // Mesures
+    int16_t raw_diff = ads.readADC_Differential_0_1();
+    int16_t raw_a2 = ads.readADC_SingleEnded(2);
+    float resistance = calculerResistance(raw_diff);
+    float courant = ina219.getCurrent_mA();
+    float tension_mV = raw_a2 * 0.125;
+    
+    // Sauvegarde
+    if (frontFile) {
+      frontFile.print(temps);
+      frontFile.print(",");
+      frontFile.print(formaterValeurCSV(resistance, 2));
+      frontFile.print(",");
+      frontFile.print(formaterValeurCSV(courant, 3));
+      frontFile.print(",");
+      frontFile.println(formaterValeurCSV(tension_mV, 2));
+    }
+    
+    delay(10);  // Mesure toutes les 10ms
+  }
+  
+  //Nettoyage
+  dacWrite(DAC_RELAIS, 0);
+  if (frontFile) frontFile.close();
+  
+  Serial.println(">>> Front montant termine");
+}
+*/
 // =============================================================================
 // THREAD 2 : AFFICHAGE ET SAUVEGARDE
 // =============================================================================
